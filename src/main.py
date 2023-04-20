@@ -2,12 +2,13 @@ import dataset as ds
 import model as m
 from torchtext.vocab import build_vocab_from_iterator
 from torch.utils.data import IterableDataset, DataLoader
-
+from sklearn.metrics import classification_report
 
 import click
 import skorch as sk
 import torch.nn as nn
 import torch
+import pandas as pd
 
 from skorch.helper import predefined_split
 
@@ -23,13 +24,14 @@ from torch.optim.lr_scheduler import LambdaLR
 @click.option("--debug", is_flag=True)
 @click.option("--train-file", type=click.Path(readable=True), required=True)
 @click.option("--dev-file", type=click.Path(readable=True), required=True)
+@click.option("--test-file", type=click.Path(readable=True), default=None)
 @click.option("--hidden-layer-sizes", default="200,100")
 @click.option("--embedding-dim", default=300)
 @click.option("--lr", default=5e-5)
 @click.option("--device", type=click.Choice(["cpu", "cuda"]))
 @click.option("--llm", is_flag=True)
 @click.option("--llm-choice", type=click.Choice(["distilbert-base-uncased", "bert-base-uncased", "openai-gpt"]))
-@click.option("--test-best", is_flag=True)
+@click.option("--model", type=click.Choice(['dan',"cnn", "lstm"]), default='dan')
 
 def main(
     batch_size,
@@ -39,14 +41,22 @@ def main(
     debug,
     train_file,
     dev_file,
+    test_file,
     hidden_layer_sizes,
     embedding_dim,
     lr,
     device,
     llm,
     llm_choice,
-    test_best,
+    model,
 ):
+    if model == 'cnn':
+        classifier = m.LLMCNNTextClassifier if llm else m.CNNTextClassifier
+    elif model == 'lstm':
+        classifier = m.LLMLSTMTextClassifier if llm else m.LSTMTextClassifier
+    else:
+        classifier = m.DANClassifier
+    
     if llm:
         from transformers import AutoTokenizer, DistilBertTokenizer, OpenAIGPTModel, BertModel, DistilBertModel
         match llm_choice:
@@ -71,13 +81,21 @@ def main(
         add_entity_tags=add_entity_tags,
         tokenize_fn = llmtoken if llm else None,
     )
-    test = ds.TSVRelationExtractionDataset(
+    dev = ds.TSVRelationExtractionDataset(
         file_path=dev_file,
         truncate=truncate,
         add_entity_tags=add_entity_tags,
         train_dataset=train,
         tokenize_fn = llmtoken if llm else None,
     )
+    if test_file:
+        test = ds.TSVRelationExtractionDataset(
+            file_path=test_file,
+            truncate=truncate,
+            add_entity_tags=add_entity_tags,
+            train_dataset=train,
+            tokenize_fn = llmtoken if llm else None,
+        )
 
     collate_callable = ds.CollateCallable(
         vocab=train.vocab, label_vocab=train.label_vocab, llm=llm,
@@ -88,7 +106,7 @@ def main(
     f1_macro = EpochScoring("f1_macro", lower_is_better=False,)
 
     net = sk.NeuralNetClassifier(
-        m.LLMCNNTextClassifier if llm else m.CNNTextClassifier,
+        classifier,
         module__llm = llmmodel if llm else None,
         module__num_classes=len(train.label_vocab),
         module__vocab_size=len(train.vocab),
@@ -105,26 +123,57 @@ def main(
         iterator_train__collate_fn=collate_callable,
         iterator_valid=DataLoader,
         iterator_valid__collate_fn=collate_callable,
-        train_split=predefined_split(test),
+        train_split=predefined_split(dev),
         callbacks=[f1_micro, 
                    f1_macro,
-                   sk.callbacks.Checkpoint(monitor='valid_acc_best', fn_prefix='CNN_FINAL_'+llm_choice, dirname='best_performers', f_params="_model.pt", f_optimizer="_opt.pt", f_history='history.json')
+                   sk.callbacks.Checkpoint(monitor='valid_acc_best', fn_prefix=model.upper()+'_FINAL_'+llm_choice, dirname='best_performers', f_params="_model.pt", f_optimizer="_opt.pt", f_history='history.json')
         ],
     )
 
-    if test_best:
-        # load up bert CNN from best_performers; re-initialize
-        f_path = 'best_performers/CNN_FINAL_bert-base-uncased'
-        net.initialize()
-        net.load_params(
-            f_params=f_path+"_model.pt", f_optimizer=f_path+"_opt.pt", f_history=f_path+'history.json')
-        
+    # Training with skorch net
     print()
-    print("-------EXPERIMENT", llm_choice, truncate, lr, "-------------------------------------")
+    print("-------TRAINING EXPERIMENT", model, llm_choice, "T:",truncate, "lr:", lr, "------------------------")
     net.fit(train, y=None)
-    
-    # net.predict(test)
-    
 
+    #load back best checkpoint
+    f_path = 'best_performers/'+model.upper()+'_FINAL_'+llm_choice
+    net.initialize()
+    net.load_params(
+        f_params=f_path+"_model.pt", f_optimizer=f_path+"_opt.pt", f_history=f_path+'history.json')
+
+    #   Check the load's accuracy, get a report
+    y_pred = net.predict(dev)
+    y_true = [train.label_vocab[R] for R in dev.relations]
+
+    print()
+    print(list(y_pred[:15]))
+    print(y_true[:15])
+    print("-------- VALIDATION CLASSIFICATION REPORT --------------")
+    print(classification_report(list(y_true), 
+                                y_pred, 
+                                labels=         list(train.label_vocab.values()),
+                                target_names=   list(train.label_vocab.keys()),
+                                zero_division=  True))
+
+    if test_file:
+        # Predict the Test data and store it in tsv
+        print()
+        print("-------------Predicting on the test set ---------------")
+
+        test_pred = net.predict(test)
+        test_sents = [(train.label_index[test_pred[i]], 
+                       sample['e1_idx'],
+                       sample['e2_idx'],
+                       sample['original']) for i,sample in enumerate(test)]
+
+        for sample in test_sents[20:25]: # looking at a random 5, novice comparison
+            print(sample[0],sample[1],sample[2], sample[3], sep='\t')
+
+        print()
+        pred_df = pd.DataFrame(test_sents, columns=['predicted_relation','e1','e2','text'])
+        print(pred_df)
+
+        pred_df.to_csv(model+'test_predictions.tsv', sep='\t', encoding='utf-8', index=False)
+    
 if __name__ == "__main__":
     main()

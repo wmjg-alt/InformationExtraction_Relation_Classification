@@ -120,7 +120,10 @@ class TSVRelationExtractionDataset(IterableDataset):
                 del d[self.sentence_column]
 
                 # Indicate the two entities for clarity
+                d['original'] = sentence
+                d['e1_idx'] = e1_idx
                 d["entity1"] = tokens[e1_idx]
+                d['e2_idx'] = e2_idx
                 d["entity2"] = tokens[e2_idx]
 
                 if self.truncate:

@@ -60,9 +60,13 @@ class LSTMTextClassifier(nn.Module):
         Dropout rate
     """
 
-    def __init__(
-        self, vocab_size=0, embedding_dim=0, hidden_layer_sizes=[100], num_classes=2, dr=0.2, llm=None,
-    ):
+    def __init__(self, 
+                 vocab_size=0, 
+                 embedding_dim=0, 
+                 hidden_layer_sizes=[100], 
+                 num_classes=2, 
+                 dr=0.2, 
+                 llm=None,):
         super(LSTMTextClassifier, self).__init__()
         self.num_layers = 2
         self.num_classes = num_classes
@@ -95,6 +99,7 @@ class LSTMTextClassifier(nn.Module):
 
     def from_embedding(self, embedded):
         # forward pass (from the outputs of the embedding)
+        
         dropouted = self.dropout(embedded)
         output, (hn, cn) = self.LSTM(dropouted)
 
